@@ -1,340 +1,225 @@
-# import requests, time, math, sys, csv
-# from pathlib import Path
-# from datetime import datetime
+# import pandas as pd
+# from datetime import datetime, timezone
+# from dateutil import parser as dparser
+# from typing import Dict, List
+# from tqdm import tqdm
+# from src.common.mw import MWClient
 
-# API = "https://en.wikipedia.org/w/api.php"
-# HEAD = {"User-Agent": "Cornell-INFO-Crowdsourcing-Project/1.0 (as3254@cornell.edu)"}
+# def iso(ts: str) -> str:
+#     # Normalize to strict UTC ISO8601 (MediaWiki format)
+#     return dparser.parse(ts).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ROOT = Path(__file__).resolve().parents[2]
-# RAW = ROOT / "data" / "raw"
-# RAW.mkdir(parents=True, exist_ok=True)
+# def collect_first_edits(start_iso: str, end_iso: str, max_scan: int = 200_000) -> pd.DataFrame:
+#     """
+#     Find users whose first-ever edit occurred within [start,end).
+#     Returns columns:
+#       user, userid, first_pageid, first_title, first_revid, first_ts
+#     """
+#     mw = MWClient()
+#     start_iso, end_iso = iso(start_iso), iso(end_iso)
 
-# AUG_START = "2024-08-01T00:00:00Z"
-# SEP_START = "2024-09-01T00:00:00Z"
-# OCT_START = "2024-10-01T00:00:00Z"
+#     # 1) Scan recentchanges for edits in window (namespace all, skip bots)
+#     params = {
+#         "action": "query",
+#         "list": "recentchanges",
+#         "rcstart": end_iso,         # API reads backwards in time by default
+#         "rcend": start_iso,
+#         "rcdir": "older",
+#         "rcshow": "!bot",
+#         "rctype": "edit|new",
+#         "rcprop": "user|userid|title|ids|timestamp|tags|flags",
+#         "rclimit": "500",
+#     }
 
-# def log(m): print(m, flush=True)
+#     earliest_seen: Dict[str, Dict] = {}
+#     scanned = 0
 
-# def q(params, retries=5):
-#     params = {**params, "format":"json", "maxlag":5}
-#     for i in range(retries):
-#         r = requests.get(API, params=params, headers=HEAD, timeout=30)
-#         if r.status_code == 503 and "maxlag" in r.text.lower():
-#             sl = 2*(i+1); log(f"[maxlag http] {sl}s"); time.sleep(sl); continue
-#         r.raise_for_status()
-#         data = r.json()
-#         if "error" in data:
-#             if data["error"].get("code") == "maxlag":
-#                 sl = 2*(i+1); log(f"[maxlag json] {sl}s"); time.sleep(sl); continue
-#             raise RuntimeError(f"API error: {data['error']}")
-#         return data
-#     raise RuntimeError("Exceeded retries")
+#     for page in mw.query_all(params):
+#         for rc in page.get("query", {}).get("recentchanges", []):
+#             scanned += 1
+#             if scanned > max_scan:
+#                 break
+#             if rc.get("anon"):
+#                 continue  # only registered newcomers
+#             user = rc.get("user")
+#             if user not in earliest_seen:
+#                 earliest_seen[user] = rc
+#         if scanned > max_scan:
+#             break
 
-# def parse_newuser_entry(e):
-#     params = e.get("params", {}) or {}
-#     userid = e.get("userid") or params.get("newuserid")
-#     name = params.get("newuser") or e.get("user") or ""
-#     title = e.get("title") or ""
-#     if (not name) and title.startswith("User:"):
-#         name = title.split("User:", 1)[1]
-#     try:
-#         userid = int(userid) if userid not in (None, "",) else None
-#     except Exception:
-#         userid = None
-#     return {"userid": userid, "name": name.strip()}
+#     if not earliest_seen:
+#         return pd.DataFrame(columns=["user","userid","first_pageid","first_title","first_revid","first_ts"])
 
-# def new_accounts(lestart_newer_iso, leend_older_iso, max_pages=30):
-#     users, cont, page = [], None, 0
-#     while True:
-#         page += 1
-#         params = {
-#             "action":"query","list":"logevents","letype":"newusers",
-#             "leprop":"title|user|userid|comment|details|timestamp",
-#             "ledir":"older","lestart": lestart_newer_iso,"leend": leend_older_iso,"lelimit": 500
+#     # 2) Verify each candidate is truly the first-ever edit via usercontribs (oldest=first)
+#     rows: List[Dict] = []
+#     for user, rc in tqdm(earliest_seen.items(), desc="Verifying first-ever edits"):
+#         uc = {
+#             "action": "query",
+#             "list": "usercontribs",
+#             "ucuser": user,
+#             "ucdir": "older",
+#             "uclimit": "1",
+#             "ucprop": "ids|title|timestamp",
 #         }
-#         if cont:
-#             if "lecontinue" in cont: params["lecontinue"] = cont["lecontinue"]
-#             if "continue"   in cont: params["continue"]   = cont["continue"]
-#         data = q(params)
-#         events = data.get("query", {}).get("logevents", [])
-#         log(f"[new_accounts] page {page}: events={len(events)}; total={len(users)}")
-#         if not events: break
-#         for e in events:
-#             u = parse_newuser_entry(e)
-#             if u["name"]:
-#                 users.append(u)
-#         cont = data.get("continue")
-#         if not cont: log("[new_accounts] done."); break
-#         if page >= max_pages: log(f"[new_accounts] page cap {max_pages}; stop."); break
-#         time.sleep(0.03)
+#         data = mw.query(uc)
+#         contribs = data.get("query", {}).get("usercontribs", [])
+#         if not contribs:
+#             continue
+#         oldest = contribs[0]
+#         # accept only if oldest timestamp lies within our window
+#         ts = oldest["timestamp"]
+#         if start_iso <= ts < end_iso:
+#             rows.append({
+#                 "user": user,
+#                 "userid": rc.get("userid"),
+#                 "first_pageid": oldest.get("pageid"),
+#                 "first_title": oldest.get("title"),
+#                 "first_revid": oldest.get("revid"),
+#                 "first_ts": ts,
+#             })
 
-#     # De-dup by username without pandas to keep integer IDs intact
-#     seen, out = set(), []
-#     for u in users:
-#         if u["name"] in seen: continue
-#         seen.add(u["name"])
-#         out.append(u)
-#     log(f"[new_accounts] unique usernames: {len(out)}")
-#     return out
-
-# def batch(iterable, n):
-#     b = []
-#     for x in iterable:
-#         b.append(x); 
-#         if len(b) == n:
-#             yield b; b = []
-#     if b: yield b
-
-# def fetch_first_edits_batched(user_objs):
-#     """
-#     Returns dict keyed by username with their first mainspace edit (if any).
-#     Tries userids in batches of 50; falls back to usernames in batches of 50.
-#     """
-#     by_name = {u["name"]: {"userid": u["userid"], "name": u["name"]} for u in user_objs}
-#     results = {}
-
-#     # 1) Try user IDs in batches
-#     id_users = [u for u in user_objs if u["userid"]]
-#     for group in batch(id_users, 50):
-#         ids = "|".join(str(u["userid"]) for u in group)
-#         data = q({
-#             "action":"query","list":"usercontribs",
-#             "ucuserids": ids, "ucdir":"newer","uclimit":1,"ucnamespace":0,
-#             "ucprop":"ids|title|timestamp|comment|tags|sizediff|ids|userid|user"
-#         })
-#         for uc in data.get("query", {}).get("usercontribs", []):
-#             name = uc.get("user")
-#             if not name: continue
-#             results[name] = {
-#                 "t0": uc["timestamp"], "revid": uc["revid"], "pageid": uc["pageid"],
-#                 "title": uc["title"], "sizediff": uc.get("sizediff"), "tags": "|".join(uc.get("tags",[]))
-#             }
-#         time.sleep(0.03)
-
-#     # 2) For those still missing, try by usernames in batches
-#     missing_names = [n for n in by_name.keys() if n not in results]
-#     for group in batch(missing_names, 50):
-#         names = "|".join(group)
-#         data = q({
-#             "action":"query","list":"usercontribs",
-#             "ucuser": names, "ucdir":"newer","uclimit":1,"ucnamespace":0,
-#             "ucprop":"ids|title|timestamp|comment|tags|sizediff|ids|userid|user"
-#         })
-#         for uc in data.get("query", {}).get("usercontribs", []):
-#             name = uc.get("user")
-#             if not name: continue
-#             results[name] = {
-#                 "t0": uc["timestamp"], "revid": uc["revid"], "pageid": uc["pageid"],
-#                 "title": uc["title"], "sizediff": uc.get("sizediff"), "tags": "|".join(uc.get("tags",[]))
-#             }
-#         time.sleep(0.03)
-
-#     return results
-
-# def collect_month(month_start_iso, next_month_start_iso, out_csv_path, user_page_cap=25, process_cap=4000, write_chunk=300):
-#     """
-#     Pull up to `user_page_cap` log pages (~user_page_cap*500 accounts), 
-#     then process at most `process_cap` users, writing incrementally every `write_chunk`.
-#     """
-#     log(f"\n[collect_month] Cohort window: {month_start_iso} .. {next_month_start_iso}")
-#     # Pull fewer pages to keep things quick
-#     users = new_accounts(lestart_newer_iso=next_month_start_iso, leend_older_iso=month_start_iso, max_pages=user_page_cap)
-#     if process_cap and len(users) > process_cap:
-#         users = users[:process_cap]
-#         log(f"[collect_month] trimming to {process_cap} users")
-
-#     # Fetch first edits in batches
-#     name_to_first = fetch_first_edits_batched(users)
-
-#     lower = datetime.fromisoformat(month_start_iso.replace("Z","+00:00"))
-#     upper = datetime.fromisoformat(next_month_start_iso.replace("Z","+00:00"))
-
-#     # Prepare writer (incremental)
-#     out_csv_path.parent.mkdir(parents=True, exist_ok=True)
-#     wrote_header = False
-#     kept = 0
-#     with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
-#         w = csv.DictWriter(f, fieldnames=["userid","name","t0","revid","pageid","title","sizediff","tags"])
-#         w.writeheader(); wrote_header = True
-
-#         for idx, u in enumerate(users, 1):
-#             name = u["name"]
-#             fe = name_to_first.get(name)
-#             if not fe: 
-#                 if idx % 500 == 0: log(f"[collect_month] processed {idx}, kept={kept} (no first-edit for many accounts)")
-#                 continue
-#             # Only keep if first edit within this month
-#             t0 = datetime.fromisoformat(fe["t0"].replace("Z","+00:00"))
-#             if not (lower <= t0 < upper): 
-#                 if idx % 500 == 0: log(f"[collect_month] processed {idx}, kept={kept} (out-of-window skips)")
-#                 continue
-
-#             row = {
-#                 "userid": u["userid"] if u["userid"] is not None else "",
-#                 "name": name, "t0": fe["t0"], "revid": fe["revid"], "pageid": fe["pageid"],
-#                 "title": fe["title"], "sizediff": fe.get("sizediff"), "tags": fe.get("tags","")
-#             }
-#             w.writerow(row); kept += 1
-
-#             if kept % write_chunk == 0:
-#                 log(f"[collect_month] wrote {kept} rows so far → {out_csv_path}")
-#                 f.flush()
-
-#     log(f"[collect_month] Saved {kept} newcomers → {out_csv_path}")
+#     df = pd.DataFrame(rows).drop_duplicates(subset=["user"]).reset_index(drop=True)
+#     return df
 
 # if __name__ == "__main__":
-#     log("[main] root  = " + str(ROOT))
-#     log("[main] raw   = " + str(RAW))
+#     import argparse, os
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--start", required=True)
+#     ap.add_argument("--end", required=True)
+#     ap.add_argument("--out", default="data/raw/first_edits.csv")
+#     ap.add_argument("--max-scan", type=int, default=200000)
+#     args = ap.parse_args()
 
-#     # August 2024 (small, fast pull)
-#     collect_month(AUG_START, SEP_START, RAW / "first_edits_2024-08.csv",
-#                   user_page_cap=12,   # ~6,000 accounts scanned
-#                   process_cap=4000,   # only process first 4k accounts
-#                   write_chunk=200)
+#     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+#     df = collect_first_edits(args.start, args.end, args.max_scan)
+#     df.to_csv(args.out, index=False)
+#     print(f"[save] {len(df)} rows → {args.out}")
 
-#     # September 2024
-#     collect_month(SEP_START, OCT_START, RAW / "first_edits_2024-09.csv",
-#                   user_page_cap=12,
-#                   process_cap=4000,
-#                   write_chunk=200)
-
-#     # # August 2024
-#     # collect_month(
-#     #   AUG_START, SEP_START, RAW / "first_edits_2024-08.csv",
-#     #   user_page_cap=200,    # scan ~100k account creations
-#     #   process_cap=100000,   # process up to 100k users
-#     #   write_chunk=200       # save every 200 kept rows
-#     # )
-
-#     # # September 2024
-#     # collect_month(
-#     #   SEP_START, OCT_START, RAW / "first_edits_2024-09.csv",
-#     #   user_page_cap=200, process_cap=100000, write_chunk=200
-#     # )
-
-#     log("[main] Done.")
-
-# src/collect/rc_first_edits.py
-import requests, time, csv
-from pathlib import Path
+import os
+import sys
+import pandas as pd
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
+from dateutil import parser as dparser
+from tqdm import tqdm
 
-API  = "https://en.wikipedia.org/w/api.php"
-HEAD = {"User-Agent": "Cornell-INFO-Crowdsourcing-Project/1.0 (as3254@cornell.edu)"}
+from src.common.mw import MWClient
 
-ROOT = Path(__file__).resolve().parents[2]
-RAW  = ROOT / "data" / "raw"
-RAW.mkdir(parents=True, exist_ok=True)
+def iso(ts: str) -> str:
+    return dparser.parse(ts).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def log(m): print(m, flush=True)
+def _utc(ts: str) -> datetime:
+    return dparser.parse(ts).astimezone(timezone.utc)
 
-def q(params, retries=5):
-    params = {**params, "format":"json", "maxlag":5}
-    for i in range(retries):
-        r = requests.get(API, params=params, headers=HEAD, timeout=30)
-        if r.status_code == 503 and "maxlag" in r.text.lower():
-            sl = 2*(i+1); log(f"[maxlag http] {sl}s"); time.sleep(sl); continue
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            if data["error"].get("code") == "maxlag":
-                sl = 2*(i+1); log(f"[maxlag json] {sl}s"); time.sleep(sl); continue
-            raise RuntimeError(f"API error: {data['error']}")
-        return data
-    raise RuntimeError("Exceeded retries")
+def fetch_new_users(start_iso: str, end_iso: str, max_users: int = 200_000) -> List[Dict]:
+    """
+    Get account creations in [start,end) via logevents (letype=newusers).
+    Returns list of dicts with 'user', 'userid', 'created'.
+    """
+    mw = MWClient()
+    start_iso, end_iso = iso(start_iso), iso(end_iso)
 
-def parse_iso_z(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    params = {
+        "action": "query",
+        "list": "logevents",
+        "letype": "newusers",
+        "lestart": end_iso,   # read older toward start
+        "leend": start_iso,
+        "ledir": "older",
+        "leprop": "timestamp|userid|user|details",
+        "lelimit": "500",
+    }
 
-def load_cohort(path: Path):
-    """Return list of dicts with name + t0 + userid from first_edits_YYYY-MM.csv."""
-    out = []
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            name = (row.get("name") or "").strip()
-            if not name: continue
-            t0 = parse_iso_z(row["t0"])
-            try:
-                userid = int(row["userid"]) if row.get("userid") else None
-            except Exception:
-                userid = None
-            out.append({"name": name, "t0": t0, "userid": userid})
-    log(f"[cohort] {path.name}: {len(out)} users")
+    out: List[Dict] = []
+    seen = set()
+
+    print(f"[newusers] window {start_iso} .. {end_iso}")
+    for page in mw.query_all(params):
+        batch = page.get("query", {}).get("logevents", [])
+        if not batch:
+            continue
+        for ev in batch:
+            user = ev.get("user")
+            if not user or user in seen:
+                continue
+            seen.add(user)
+            out.append({
+                "user": user,
+                "userid": ev.get("userid"),
+                "created": ev.get("timestamp"),
+            })
+            if len(out) >= max_users:
+                break
+        print(f"[newusers] batch: {len(batch)} (total unique users: {len(out)})")
+        if len(out) >= max_users:
+            break
+
+    print(f"[newusers] total new accounts: {len(out)}")
     return out
 
-def fetch_next_edit_after_t0(user, month_start_iso: str, next_month_start_iso: str):
+def fetch_first_edit(mw: MWClient, user: str) -> Optional[Dict]:
     """
-    For a single user, return their first mainspace edit STRICTLY AFTER t0
-    and before next_month_start_iso. Otherwise return None.
+    Oldest contribution for user (their first-ever edit), or None if no edits.
     """
-    name = user["name"]
-    t0   = user["t0"]
-
-    # Query starting at t0, chronological order; ask for up to 2 edits
-    data = q({
+    params = {
         "action": "query",
         "list": "usercontribs",
-        "ucuser": name,
-        "ucnamespace": 0,
+        "ucuser": user,
         "ucdir": "newer",
-        "ucstart": t0.isoformat().replace("+00:00", "Z"),   # inclusive boundary
-        "ucend": next_month_start_iso,                      # exclusive upper bound
-        "uclimit": 2,
-        "ucprop": "ids|title|timestamp|comment|sizediff|userid|user|tags",
-    })
+        "uclimit": "1",
+        "ucprop": "ids|title|timestamp|comment|sizediff",
+    }
+    data = mw.query(params)
+    rows = data.get("query", {}).get("usercontribs", [])
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "first_pageid": r.get("pageid"),
+        "first_title": r.get("title"),
+        "first_revid": r.get("revid"),
+        "first_ts": r.get("timestamp"),
+        "first_comment": r.get("comment", ""),
+        "first_sizediff": r.get("sizediff"),
+    }
 
-    ucs = data.get("query", {}).get("usercontribs", [])
-    # Find the first contrib STRICTLY after t0 (ignore the edit at exactly t0)
-    for uc in ucs:
-        t = parse_iso_z(uc["timestamp"])
-        if t > t0:
-            return {
-                "userid": uc.get("userid") or "",
-                "name": name,
-                "t": uc["timestamp"],
-                "revid": uc.get("revid"),
-                "pageid": uc.get("pageid"),
-                "title": uc.get("title"),
-                "sizediff": uc.get("sizediff"),
-                "tags": "|".join(uc.get("tags", [])),
-            }
-    return None
+def collect_first_edits(start_iso: str, end_iso: str, out_csv: str, max_users: int = 200_000):
+    mw = MWClient()
+    start_iso, end_iso = iso(start_iso), iso(end_iso)
 
-def collect_next_edits_for_cohort(month_start_iso, next_month_start_iso,
-                                  cohort_csv_path: Path, out_csv_path: Path,
-                                  sleep_s: float = 0.02):
-    cohort = load_cohort(cohort_csv_path)
-    found = {}
-    for i, user in enumerate(cohort, 1):
-        rec = fetch_next_edit_after_t0(user, month_start_iso, next_month_start_iso)
-        if rec: found[user["name"]] = rec
-        if i % 50 == 0: log(f"[progress] {i}/{len(cohort)} processed; found {len(found)}")
-        time.sleep(sleep_s)  # be polite
+    # 1) New accounts created in window
+    new_users = fetch_new_users(start_iso, end_iso, max_users=max_users)
+    if not new_users:
+        pd.DataFrame(columns=[
+            "user","userid","created","first_pageid","first_title","first_revid",
+            "first_ts","first_comment","first_sizediff"
+        ]).to_csv(out_csv, index=False)
+        print(f"[save] 0 rows → {out_csv}")
+        return
 
-    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["userid","name","t","revid","pageid","title","sizediff","tags"])
-        w.writeheader()
-        for name in sorted(found.keys()):
-            w.writerow(found[name])
-    log(f"[save] wrote {len(found)} rows → {out_csv_path}")
+    # 2) First edit for each new account
+    rows: List[Dict] = []
+    for nu in tqdm(new_users, desc="Fetching first edits"):
+        fe = fetch_first_edit(mw, nu["user"])
+        if fe is None:
+            # Some new accounts never make an edit
+            continue
+        # Keep only those whose first-ever edit happened inside the window
+        if start_iso <= fe["first_ts"] < end_iso:
+            rows.append({**nu, **fe})
+
+    df = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"[save] {len(df)} rows → {out_csv}")
 
 if __name__ == "__main__":
-    AUG_START = "2024-08-01T00:00:00Z"
-    SEP_START = "2024-09-01T00:00:00Z"
-    OCT_START = "2024-10-01T00:00:00Z"
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--out", default="data/raw/first_edits.csv")
+    ap.add_argument("--max-users", type=int, default=200000)
+    args = ap.parse_args()
 
-    ROOT = Path(__file__).resolve().parents[2]
-    RAW  = ROOT / "data" / "raw"
-
-    AUG_COHORT = RAW / "first_edits_2024-08.csv"
-    SEP_COHORT = RAW / "first_edits_2024-09.csv"
-
-    AUG_OUT = RAW / "rc_second_edits_2024-08.csv"
-    SEP_OUT = RAW / "rc_second_edits_2024-09.csv"
-
-    log("[main] fetching true second edits (strictly after t0)…")
-    collect_next_edits_for_cohort(AUG_START, SEP_START, AUG_COHORT, AUG_OUT)
-    collect_next_edits_for_cohort(SEP_START, OCT_START, SEP_COHORT, SEP_OUT)
-    log("[main] Done.")
+    collect_first_edits(args.start, args.end, args.out, args.max_users)
